@@ -92,7 +92,7 @@ with early stopping based on approximate KL
 def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10):
+        target_kl=0.01, logger_kwargs=dict(), save_freq=10, clip=True, beta=1.0):
     """
 
     Args:
@@ -163,6 +163,13 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
 
+        clip: Flag to control which method (clipping or KL penalty) to use.
+              (Takashi Nagata added)
+
+        beta: weight for the KL penalty. 
+              Default is 1 according to the original paper>
+                  "beta was initiated at 1" in Table 1 description.
+              (Takashi Nagata added)
     """
 
     logger = EpochLogger(**logger_kwargs)
@@ -182,6 +189,9 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
     # Inputs to computation graph
     x_ph, a_ph = core.placeholders_from_spaces(env.observation_space, env.action_space)
     adv_ph, ret_ph, logp_old_ph = core.placeholders(None, None, None)
+    beta_var = tf.Variable(initial_value=beta, trainable=False, dtype=tf.float32) # to compute KL penalty
+    target_kldiv = tf.Variable(initial_value=target_kl, trainable=False, dtype=tf.float32) # to compute KL penalty
+    dtarg_coef = tf.constant(1.5, name='dtarg_coef')
 
     # Main outputs from computation graph
     pi, logp, logp_pi, v = actor_critic(x_ph, a_ph, **ac_kwargs)
@@ -202,9 +212,19 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
 
     # PPO objectives
     ratio = tf.exp(logp - logp_old_ph)          # pi(a|s) / pi_old(a|s)
-    min_adv = tf.where(adv_ph>0, (1+clip_ratio)*adv_ph, (1-clip_ratio)*adv_ph)
-    pi_loss = -tf.reduce_mean(tf.minimum(ratio * adv_ph, min_adv))
-    v_loss = tf.reduce_mean((ret_ph - v)**2)
+    if clip==True:
+        min_adv = tf.where(adv_ph>0, (1+clip_ratio)*adv_ph, (1-clip_ratio)*adv_ph)
+        pi_loss = -tf.reduce_mean(tf.minimum(ratio * adv_ph, min_adv))
+        v_loss = tf.reduce_mean((ret_ph - v)**2)
+    else:
+        # Compute KL penalty version
+        print("Use KL penalty")
+        kl_div = tf.reduce_sum( tf.exp(logp) * (logp - logp_old_ph) )
+        pi_loss = -tf.reduce_mean( ratio * adv_ph - beta_var*kl_div )
+        v_loss = tf.reduce_mean((ret_ph - v)**2)
+        condition = tf.math.less(kl_div, dtarg_coef * target_kldiv)
+
+        beta_var = tf.cond(condition, lambda: beta_var/2.0, lambda: beta_var*2.0)
 
     # Info (useful to watch during learning)
     approx_kl = tf.reduce_mean(logp_old_ph - logp)      # a sample estimate for KL-divergence, easy to compute
@@ -227,15 +247,19 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
 
     def update():
         inputs = {k:v for k,v in zip(all_phs, buf.get())}
-        pi_l_old, v_l_old, ent = sess.run([pi_loss, v_loss, approx_ent], feed_dict=inputs)
+        if clip:
+            pi_l_old, v_l_old, ent = sess.run([pi_loss, v_loss, approx_ent], feed_dict=inputs)
+        else:
+            pi_l_old, v_l_old, ent, beta = sess.run([pi_loss, v_loss, approx_ent, beta_var], feed_dict=inputs)
 
         # Training
         for i in range(train_pi_iters):
             _, kl = sess.run([train_pi, approx_kl], feed_dict=inputs)
             kl = mpi_avg(kl)
-            if kl > 1.5 * target_kl:
+            if kl > 1.5 * target_kl and clip:
                 logger.log('Early stopping at step %d due to reaching max kl.'%i)
                 break
+
         logger.store(StopIter=i)
         for _ in range(train_v_iters):
             sess.run(train_v, feed_dict=inputs)
@@ -245,7 +269,8 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
         logger.store(LossPi=pi_l_old, LossV=v_l_old, 
                      KL=kl, Entropy=ent, ClipFrac=cf,
                      DeltaLossPi=(pi_l_new - pi_l_old),
-                     DeltaLossV=(v_l_new - v_l_old))
+                     DeltaLossV=(v_l_new - v_l_old),
+                     Beta=beta)
 
     start_time = time.time()
     o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
@@ -294,7 +319,10 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
         logger.log_tabular('DeltaLossV', average_only=True)
         logger.log_tabular('Entropy', average_only=True)
         logger.log_tabular('KL', average_only=True)
-        logger.log_tabular('ClipFrac', average_only=True)
+        if clip:
+            logger.log_tabular('ClipFrac', average_only=True)
+        else:
+             logger.log_tabular('Beta', average_only=True)
         logger.log_tabular('StopIter', average_only=True)
         logger.log_tabular('Time', time.time()-start_time)
         logger.dump_tabular()
@@ -311,6 +339,8 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=4000)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='ppo')
+    parser.add_argument('--clip', type=bool, default=True)
+    parser.add_argument('--beta', type=float, default=1.0)
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
