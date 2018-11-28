@@ -21,7 +21,7 @@ In our project, we investigate these two variants and compare the performance, i
     - Different hyperparameters
 
 
-## Bried review on PPO
+## Brief review on PPO
 
 PPO is one of the policy gradient methods which is originaly proposed by OpenAI which uses only first-order optimization (wheres TRPO, their precedindg method, is a second-order method).
 
