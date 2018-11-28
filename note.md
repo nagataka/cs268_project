@@ -23,6 +23,17 @@ In our project, we investigate these two variants and compare the performance, i
 
 ## Bried review on PPO
 
+PPO is one of the policy gradient methods which is originaly proposed by OpenAI which uses only first-order optimization (wheres TRPO, their precedindg method, is a second-order method).
+
+##### Policy Gradient Methods
+
+
+##### Trust Region Methods
+
+(Maybe good to quickly study trust region method in standard Optimization context to check if the term is used a bit differently)
+
+
+
 
 
 ## CLIP and KL
