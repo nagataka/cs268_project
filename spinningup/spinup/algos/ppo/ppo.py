@@ -269,8 +269,9 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
         logger.store(LossPi=pi_l_old, LossV=v_l_old, 
                      KL=kl, Entropy=ent, ClipFrac=cf,
                      DeltaLossPi=(pi_l_new - pi_l_old),
-                     DeltaLossV=(v_l_new - v_l_old),
-                     Beta=beta)
+                     DeltaLossV=(v_l_new - v_l_old))
+        if not clip:
+            logger.store(Beta=beta)
 
     start_time = time.time()
     o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
