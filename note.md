@@ -18,7 +18,8 @@ In our project, we investigate these two variants and compare the performance, i
 
 - Performance comparison
     - $L^{CLIP}$ and $L^{KLPEN}$
-    - Different hyperparameters
+    - ~~Different hyperparameters~~
+        - Actually, it's done in the paper for clipping ratio, d_targ, and beta... (See. Table 1)
 
 
 ## Brief review on PPO

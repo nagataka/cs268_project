@@ -219,7 +219,8 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
     else:
         # Compute KL penalty version
         print("Use KL penalty")
-        kl_div = tf.reduce_sum( tf.exp(logp) * (logp - logp_old_ph) )
+        #kl_div = tf.reduce_sum( tf.exp(logp) * (logp_old_ph - logp) )
+        kl_div = tf.reduce_mean(logp_old_ph - logp)
         pi_loss = -tf.reduce_mean( ratio * adv_ph - beta_var*kl_div )
         v_loss = tf.reduce_mean((ret_ph - v)**2)
         condition = tf.math.less(kl_div, dtarg_coef * target_kldiv)
@@ -330,6 +331,8 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
 
 if __name__ == '__main__':
     import argparse
+    from sklearn.model_selection import GridSearchCV
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='HalfCheetah-v2')
     parser.add_argument('--hid', type=int, default=64)
@@ -346,7 +349,6 @@ if __name__ == '__main__':
 
     mpi_fork(args.cpu)  # run parallel code with mpi
 
-    from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
     ppo(lambda : gym.make(args.env), actor_critic=core.mlp_actor_critic,
