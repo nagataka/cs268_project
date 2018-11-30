@@ -16,11 +16,16 @@ In our project, we investigate these two variants and compare the performance, i
 
 (Optional) In addition to this, we'll study how hyperparameters contribute to (or affect) the performance.
 
-- Performance comparison
+- Code PPO from scratch
+- Performance comparison (env: Luna Lander)
     - $L^{CLIP}$ and $L^{KLPEN}$
-    - ~~Different hyperparameters~~
-        - Actually, it's done in the paper for clipping ratio, d_targ, and beta... (See. Table 1)
-
+    - Different num of workers and investigate how linearly scale the PPO is
+    - Different hyperparameters
+        - Repro the Table 1
+- (Compare DDPG + HER vs. PPO + HER)
+- Compare with DDPG + RND and PPO + RND
+    - implement RND
+        - Be sure to normalize reward
 
 ## Brief review on PPO
 
