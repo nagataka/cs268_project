@@ -34,7 +34,7 @@ def discounted_sum_with_dones(rewards, dones, gamma):
     return discounted[::-1]
 
 
-def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
+def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_clip=False):
 
     if use_kl_penalty_instead_of_clip:
         print("kl penalty not implemented yet")
@@ -62,23 +62,18 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
     actions_tf_type = tf.float32 if actions_are_continous else tf.int32
     actions_tf = tf.placeholder(dtype=actions_tf_type, shape=actions_tf_shape)
 
-    if use_cnn:
-        cnn_tf = nature_cnn(observations_tf)
-    else:
-        cnn_tf = None
-
-    # Actor Network
-    with tf.variable_scope("actor"):
+    with tf.variable_scope("actor_critic"):
         if use_cnn:
-            actor_tf = cnn_tf
+            ac_tf = nature_cnn(observations_tf)
         else:
-            actor_tf = observations_tf
-
-        for hidden_size in [128, 128]:
-            actor_tf = tf.layers.dense(actor_tf, units=hidden_size, activation=tf.nn.leaky_relu)
+            ac_tf = observations_tf
+            for hidden_size in [64, 64]:
+                ac_tf = tf.layers.dense(ac_tf, units=hidden_size, activation=tf.nn.leaky_relu)
 
         actor_tf_output_layer_units = envs.action_space.shape[-1] if actions_are_continous else envs.action_space.n
-        actor_tf = tf.layers.dense(actor_tf, actor_tf_output_layer_units, activation=None)
+        actor_tf = tf.layers.dense(ac_tf, actor_tf_output_layer_units, activation=None)
+
+        value_tf = tf.squeeze(tf.layers.dense(ac_tf, 1, activation=None), axis=1)
 
         if actions_are_continous:
             log_std = tf.get_variable(name='log_std', initializer=-0.5 * np.ones(envs.action_space.shape[-1], dtype=np.float32))
@@ -93,25 +88,15 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
             logp_pi_tf = tf.reduce_sum(tf.one_hot(pi_tf, depth=envs.action_space.n) * logp_all, axis=1)
         assert logp_pi_tf.shape.as_list() == logp_tf.shape.as_list()
 
-    with tf.variable_scope("critic"):
-        # Value Network
-        if use_cnn:
-            critic_tf = cnn_tf
-        else:
-            critic_tf = observations_tf
-
-        for hidden_size in [128, 128]:
-            critic_tf = tf.layers.dense(critic_tf, hidden_size, activation=tf.nn.leaky_relu)
-        value_tf = tf.squeeze(tf.layers.dense(critic_tf, 1, activation=None), axis=1)
-
     # Values Necessary for Loss Calculation
     advantages_tf = tf.placeholder(dtype=tf.float32)
     returns_tf = tf.placeholder(dtype=tf.float32)
     logp_old_tf = tf.placeholder(dtype=tf.float32, shape=(None,))
     assert logp_old_tf.shape.as_list() == logp_tf.shape.as_list()
 
-    clip_ratio = 0.2
+    clip_ratio = 0.1
     entropy_coef = 0.01
+    vf_coef = 0.5
 
     approx_kl = tf.reduce_mean(logp_old_tf - logp_tf)  # a sample estimate for KL-divergence, easy to compute
     approx_ent = tf.reduce_mean(-logp_tf)  # a sample estimate for entropy, also easy to compute
@@ -121,16 +106,25 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
     pi_loss = -tf.reduce_mean(tf.minimum(policy_ratio * advantages_tf, min_adv)) - entropy_coef * approx_ent
     v_loss = tf.reduce_mean((returns_tf - value_tf) ** 2)
 
-    # Info (useful to watch during learning)
+    loss = pi_loss + vf_coef * v_loss
 
+    # Info (useful to watch during learning)
     clipped = tf.logical_or(policy_ratio > (1 + clip_ratio), policy_ratio < (1 - clip_ratio))
     clipfrac = tf.reduce_mean(tf.cast(clipped, tf.float32))
 
-    actor_lr = 3e-4
-    critic_lr = 1e-3
+    learning_rate = 2.5e-4
+    max_grad_norm = 0.5
 
-    train_pi = tf.train.AdamOptimizer(learning_rate=actor_lr).minimize(loss=pi_loss)
-    train_v = tf.train.AdamOptimizer(learning_rate=critic_lr).minimize(loss=v_loss)
+    trainer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+    params = tf.trainable_variables('actor_critic')
+    grads_and_var = trainer.compute_gradients(loss, params)
+    grads, var = zip(*grads_and_var)
+
+    if max_grad_norm is not None:
+        grads, _grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
+    grads_and_var = list(zip(grads, var))
+
+    train = trainer.apply_gradients(grads_and_var)
 
     # TODO: remove two lines
     var_counts = tuple(count_vars(scope) for scope in ['actor', 'critic'])
@@ -142,14 +136,16 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
     sess.run(tf.global_variables_initializer())
     with sess.as_default():
 
-        steps_per_epoch = 128 * num_procs
-        epochs = 10000
+        num_train_updates_per_epoch = 4
+        num_minibatches_per_epoch_trian_update = 4
+        total_timesteps = int(total_timesteps)
+        time_horizon = 128
+        total_epoch_batch_size = time_horizon * num_procs
+        num_epochs = total_timesteps // total_epoch_batch_size
+        train_minibatch_size = total_epoch_batch_size // num_minibatches_per_epoch_trian_update
         gamma = 0.99
-        lam = 0.97
-        train_pi_iters = 80
-        train_v_iters = 80
+        lam = 0.95
         target_kl = 0.01
-        local_steps_per_epoch = int(steps_per_epoch / num_procs)
 
         curr_obs = envs.reset()
 
@@ -162,7 +158,7 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
 
         observations_input_shape = (-1, *envs.observation_space.shape) if observations_are_continous else (-1, 1)
 
-        for epoch in range(epochs):
+        for epoch in range(1, num_epochs+1):
 
             # any_episodes_were_finished = False
 
@@ -173,7 +169,7 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
             batch_values = []
             batch_dones = []
 
-            for t in range(local_steps_per_epoch):
+            for t in range(time_horizon):
                 curr_actions, curr_values, curr_logps = sess.run([pi_tf, value_tf, logp_pi_tf],
                                                   feed_dict={observations_tf: np.reshape(curr_obs, observations_input_shape)})
 
@@ -248,17 +244,16 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
                 batch_advantages[n] = advantages
 
 
-            batch_size = num_procs*local_steps_per_epoch
-            final_batch_obs_shape = (batch_size,) + (envs.observation_space.shape if observations_are_continous else (1,))
+            final_batch_obs_shape = (total_epoch_batch_size,) + (envs.observation_space.shape if observations_are_continous else (1,))
             batch_obs = batch_obs.reshape(final_batch_obs_shape)
 
-            final_batch_actions_shape = (batch_size,) + envs.action_space.shape if actions_are_continous else (-1,)
+            final_batch_actions_shape = (total_epoch_batch_size,) + envs.action_space.shape if actions_are_continous else (-1,)
             batch_actions = batch_actions.reshape(final_batch_actions_shape)
 
-            batch_returns = batch_returns.reshape((batch_size,))
-            batch_advantages = batch_advantages.reshape((batch_size,))
+            batch_returns = batch_returns.reshape((total_epoch_batch_size,))
+            batch_advantages = batch_advantages.reshape((total_epoch_batch_size,))
             # batch_values = batch_values.reshape((-1, 1))
-            batch_logps = batch_logps.reshape((batch_size,))
+            batch_logps = batch_logps.reshape((total_epoch_batch_size,))
 
             # Train actor critic
 
@@ -282,41 +277,57 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
             # }
             # logger.log(debug_dict)
 
-            pi_l_old, v_l_old, entropy = sess.run([pi_loss, v_loss, approx_ent], feed_dict=train_inputs)
 
-            for i in range(train_pi_iters):
-                _, kl, new_logp, min_adv_calc, policy_ratio_calc = sess.run([train_pi, approx_kl, logp_tf, min_adv, policy_ratio], feed_dict=train_inputs)
-                # logger.log("new logp: {}".format(new_logp))
-                # logger.log("min adv: {}".format(min_adv_calc))
-                # logger.log("policy ratio: {}".format(policy_ratio_calc))
-                if kl > 1.5 * target_kl:
+            sample_indexes = np.arange(total_epoch_batch_size)
+            for _ in range(num_train_updates_per_epoch):
+                np.random.shuffle(sample_indexes)
+                kls_from_update = []
+                for i in range(num_minibatches_per_epoch_trian_update):
+                    start_index = i * train_minibatch_size
+                    end_index = (i+1) * train_minibatch_size
+                    samples_indexes_to_train_on = sample_indexes[start_index:end_index]
+                    minibatch_feed_dict = {k: v[samples_indexes_to_train_on] for k, v in train_inputs.items()}
+
+                    pi_l_old, v_l_old, entropy = sess.run([pi_loss, v_loss, approx_ent], feed_dict=minibatch_feed_dict)
+
+                    _, kl, new_logp, min_adv_calc, policy_ratio_calc = sess.run([train, approx_kl, logp_tf, min_adv, policy_ratio], feed_dict=minibatch_feed_dict)
+
+                    pi_l_new, v_l_new, kl, cf = sess.run([pi_loss, v_loss, approx_kl, clipfrac], feed_dict=minibatch_feed_dict)
+
+                    kls_from_update.append(kl)
+
+                    logger.store(LossPi=pi_l_old, LossV=v_l_old,
+                                 KL=kl, Entropy=entropy, ClipFrac=cf,
+                                 DeltaLossPi=(pi_l_new - pi_l_old), DeltaLossV=(v_l_new - v_l_old))
+
+                if np.mean(kls_from_update) > 1.5 * target_kl:
                     logger.log("early stopping at step {} due to reaching max kl".format(i))
                     break
-            logger.store(StopIter=i)
+                logger.store(StopIter=i)
 
-            critic_vars_before_update = U.GetFlat(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic'))()
+        # for i in range(train_pi_iters):
+            #     # logger.log("new logp: {}".format(new_logp))
+            #     # logger.log("min adv: {}".format(min_adv_calc))
+            #     # logger.log("policy ratio: {}".format(policy_ratio_calc))
 
-            for _ in range(train_v_iters):
-                sess.run(train_v, feed_dict=train_inputs)
 
-            critic_vars_after_update = U.GetFlat(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic'))()
+            # critic_vars_before_update = U.GetFlat(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic'))()
 
-            assert len(critic_vars_before_update) == len(critic_vars_after_update)
-            assert len(critic_vars_before_update) > 100
-            assert not np.allclose(critic_vars_before_update, critic_vars_after_update)
+            # critic_vars_after_update = U.GetFlat(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic'))()
+            #
+            # assert len(critic_vars_before_update) == len(critic_vars_after_update)
+            # assert len(critic_vars_before_update) > 100
+            # assert not np.allclose(critic_vars_before_update, critic_vars_after_update)
 
-            pi_l_new, v_l_new, kl, cf = sess.run([pi_loss, v_loss, approx_kl, clipfrac], feed_dict=train_inputs)
-            logger.store(LossPi=pi_l_old, LossV=v_l_old,
-                         KL=kl, Entropy=entropy, ClipFrac=cf,
-                         DeltaLossPi=(pi_l_new - pi_l_old), DeltaLossV=(v_l_new - v_l_old))
 
-            # Log info about epoch
+            #
+            # # Log info about epoch
             logger.log_tabular('Epoch', epoch)
-            # if any_episodes_were_finished:
-            #     logger.log_tabular('EpRet', with_min_and_max=True)
-            #     logger.log_tabular('EpLen', average_only=True)
+            # # if any_episodes_were_finished:
+            # #     logger.log_tabular('EpRet', with_min_and_max=True)
+            # #     logger.log_tabular('EpLen', average_only=True)
             logger.log_tabular('VVals', with_min_and_max=True)
-            logger.log_tabular('TotalEnvInteracts', (epoch + 1) * steps_per_epoch)
+            logger.log_tabular('TotalEnvInteracts', epoch * total_epoch_batch_size)
             logger.log_tabular('LossPi', average_only=True)
             logger.log_tabular('LossV', average_only=True)
             logger.log_tabular('DeltaLossPi', average_only=True)
@@ -324,7 +335,7 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
             logger.log_tabular('Entropy', average_only=True)
             logger.log_tabular('KL', average_only=True)
             logger.log_tabular('ClipFrac', average_only=True)
-            logger.log_tabular('StopIter', average_only=True)
+            # logger.log_tabular('StopIter', average_only=True)
             logger.log_tabular('Time', time.time() - start_time)
             logger.dump_tabular()
 
@@ -333,10 +344,13 @@ def run_ppo(envs, use_cnn=False, use_kl_penalty_instead_of_clip=False):
 
 if __name__ == '__main__':
 
+    # env_id = "CartPole-v1"
     env_id = "PongNoFrameskip-v4"
-    num_procs = 8
+    # env_id = "HalfCheetah-v2"
+    num_procs = 32
     seed = 42
     use_kl_penalty = False
+    total_timesteps = 2e7
 
     env_type = get_env_type(env_id)[0]
 
@@ -351,4 +365,4 @@ if __name__ == '__main__':
         env_type = None
         envs = SubprocVecEnv([lambda: gym.make(env_id) for _ in range(num_procs)])
 
-    run_ppo(envs=envs, use_cnn=True if env_type == 'atari' else False, use_kl_penalty_instead_of_clip=use_kl_penalty)
+    run_ppo(envs=envs, use_cnn=True if env_type == 'atari' else False, total_timesteps=total_timesteps, use_kl_penalty_instead_of_clip=use_kl_penalty)
