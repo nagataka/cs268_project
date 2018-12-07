@@ -16,7 +16,7 @@ In our project, we investigate these two variants and compare the performance, i
 
 (Optional) In addition to this, we'll study how hyperparameters contribute to (or affect) the performance.
 
-- Code PPO from scratch
+- ~~Code PPO from scratch~~
 - Performance comparison (env: Luna Lander)
     - $L^{CLIP}$ and $L^{KLPEN}$
     - Different num of workers and investigate how linearly scale the PPO is
@@ -26,6 +26,8 @@ In our project, we investigate these two variants and compare the performance, i
 - Compare with DDPG + RND and PPO + RND
     - implement RND
         - Be sure to normalize reward
+- (Takashi ToDo) Check baseline code + mujoco
+- (Takashi ToDo) prepare TRPO writeup
 
 ## Brief review on PPO
 
@@ -49,6 +51,15 @@ PPO is one of the policy gradient methods which is originaly proposed by OpenAI 
 ## Hyper parameters
 
 
+## Experimental results
+
+##### clipping with 1 core
+
+##### clipping with 1 core
+
+##### clipping with 1 core
+
+
 ##### Refs
 
 - [Training with Proximal Policy Optimization](https://github.com/Unity-Technologies/ml-agents/blob/master/docs/Training-PPO.md)
@@ -60,6 +71,8 @@ PPO is one of the policy gradient methods which is originaly proposed by OpenAI 
 
 - General
     - [Spinningup](https://spinningup.openai.com/en/latest/index.html)
+    - command
+        * python -m spinup.run ppo --hid "[32,32]" --exp_name installtest --gamma 0.999 --clip False --beta 1.0
 - KL penalty
     - https://github.com/SSS135/pytorch-rl-kit
     - https://github.com/joschu/modular_rl
@@ -67,3 +80,5 @@ PPO is one of the policy gradient methods which is originaly proposed by OpenAI 
 
 
 ##### Which one ($L^{CLIP} or L^{KLPEN}$) the code implemented?
+
+
