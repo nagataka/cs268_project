@@ -2,30 +2,85 @@ from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
 import tensorflow as tf
 import numpy as np
 import gym.spaces
-from spinup.utils.logx import EpochLogger
-from spinup.algos.ppo.core import count_vars
 import time
-import baselines.common.tf_util as U
+import argparse
+import os
+from collections import deque
+from baselines import logger
 from baselines.run import get_env_type
 from baselines.common.cmd_util import make_atari_env, make_mujoco_env
 from baselines.common.models import nature_cnn
 
+DEFAULT_PARAMS = {
+    "env_id": "PongNoFrameskip-v4",
+    "num_workers": 32,
+    "total_timesteps": 2e7,
+    "num_train_updates_per_epoch": 4,
+    "num_minibatches_per_epoch_train_update": 4,
+    "time_horizon": 128,
+    "gamma": 0.99,
+    "lam": 0.95,
+    "target_kl": 0.01,
+    "learning_rate": 2.5e-4,
+    "max_grad_norm": 0.5,
+    "kl_regularization_method": "clip",  # options are 'clip', 'penalty', or 'adaptive-penalty'
+    "clip_ratio": 0.1,
+    "entropy_coef": 0.01,
+    "vf_coef": 0.5,
+    "seed": 42,
+    "save_best_model": True,
+    "min_save_interval_seconds": 120,
+    "restore_from_checkpoint": 'none'
+}
 
-def categorical_entropy(logits):
-    a0 = logits - tf.reduce_max(logits, axis=-1, keepdims=True)
-    ea0 = tf.exp(a0)
-    z0 = tf.reduce_sum(ea0, axis=-1, keepdims=True)
-    p0 = ea0 / z0
-    return tf.reduce_sum(p0 * (tf.log(z0) - a0), axis=-1)
+
+def log_params(params, logger=logger):
+    for key in sorted(params.keys()):
+        logger.info('{}: {}'.format(key, params[key]))
+
+
+def get_convert_arg_to_type_fn(arg_type):
+
+    if arg_type == bool:
+        def fn(value):
+            if value in ['None', 'none']:
+                return None
+            if value in ['True', 'true', 't', '1']:
+                return True
+            elif value in ['False', 'false', 'f', '0']:
+                return False
+            else:
+                raise ValueError("Argument must either be the string, \'True\' or \'False\'")
+        return fn
+
+    elif arg_type == int:
+        def fn(value):
+            if value in ['None', 'none']:
+                return None
+            return int(float(value))
+        return fn
+    elif arg_type == str:
+        def fn(value):
+            if value in ['None', 'none']:
+                return None
+            return str(value)
+        return fn
+    else:
+        def fn(value):
+            if value in ['None', 'none']:
+                return None
+            return arg_type(value)
+        return fn
 
 
 def gaussian_likelihood(x, mu, log_std):
+    # from spinning up
     pre_sum = -0.5 * (((x-mu)/(tf.exp(log_std)+1e-8))**2 + 2*log_std + np.log(2*np.pi))
     return tf.reduce_sum(pre_sum, axis=1)
 
 
 def discounted_sum_with_dones(rewards, dones, gamma):
-    # from baselines
+    # from baselines A2C
     discounted = []
     r = 0
     for reward, done in zip(rewards[::-1], dones[::-1]):
@@ -34,26 +89,25 @@ def discounted_sum_with_dones(rewards, dones, gamma):
     return discounted[::-1]
 
 
-def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_clip=False):
+def run_ppo(envs, use_cnn, num_workers, total_timesteps, num_train_updates_per_epoch,
+            num_minibatches_per_epoch_train_update, time_horizon, gamma, lam, target_kl,
+            learning_rate, max_grad_norm, kl_regularization_method, clip_ratio,
+            entropy_coef, vf_coef, seed, save_best_model, min_save_interval_seconds, restore_from_checkpoint, **kwargs):
 
-    if use_kl_penalty_instead_of_clip:
-        print("kl penalty not implemented yet")
-        exit(0)
+    if kl_regularization_method != 'clip':
+        print("kl penalty method not implemented yet")
+        exit(1)
 
-    seed = 42
     tf.set_random_seed(seed)
     np.random.seed(seed)
 
-    logger = EpochLogger()
     # Setup multiple envs in their own processes
     observations_are_continous = isinstance(envs.observation_space, gym.spaces.Box)
     actions_are_continous = isinstance(envs.action_space, gym.spaces.Box)
-    logger.log("Observation space: {}".format(envs.observation_space))
-    logger.log("Action space: {}".format(envs.action_space))
+    logger.info("Observation space: {}".format(envs.observation_space))
+    logger.info("Action space: {}".format(envs.action_space))
 
     # Build TensorFlow graph
-
-    # Inputs to Actor Critic
 
     observations_tf_shape = (None, *envs.observation_space.shape) if observations_are_continous else (None, 1)
     observations_tf = tf.placeholder(dtype=tf.float32, shape=observations_tf_shape)
@@ -94,26 +148,18 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
     logp_old_tf = tf.placeholder(dtype=tf.float32, shape=(None,))
     assert logp_old_tf.shape.as_list() == logp_tf.shape.as_list()
 
-    clip_ratio = 0.1
-    entropy_coef = 0.01
-    vf_coef = 0.5
-
     approx_kl = tf.reduce_mean(logp_old_tf - logp_tf)  # a sample estimate for KL-divergence, easy to compute
     approx_ent = tf.reduce_mean(-logp_tf)  # a sample estimate for entropy, also easy to compute
 
     policy_ratio = tf.exp(logp_tf - logp_old_tf)
     min_adv = tf.where(advantages_tf > 0, (1 + clip_ratio) * advantages_tf, (1 - clip_ratio) * advantages_tf)
-    pi_loss = -tf.reduce_mean(tf.minimum(policy_ratio * advantages_tf, min_adv)) - entropy_coef * approx_ent
+    pi_loss = -tf.reduce_mean(tf.minimum(policy_ratio * advantages_tf, min_adv))
     v_loss = tf.reduce_mean((returns_tf - value_tf) ** 2)
 
-    loss = pi_loss + vf_coef * v_loss
+    loss = pi_loss + vf_coef * v_loss - entropy_coef * approx_ent
 
-    # Info (useful to watch during learning)
     clipped = tf.logical_or(policy_ratio > (1 + clip_ratio), policy_ratio < (1 - clip_ratio))
     clipfrac = tf.reduce_mean(tf.cast(clipped, tf.float32))
-
-    learning_rate = 2.5e-4
-    max_grad_norm = 0.5
 
     trainer = tf.train.AdamOptimizer(learning_rate=learning_rate)
     params = tf.trainable_variables('actor_critic')
@@ -126,37 +172,43 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
 
     train = trainer.apply_gradients(grads_and_var)
 
-    # TODO: remove two lines
-    var_counts = tuple(count_vars(scope) for scope in ['actor', 'critic'])
-    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d\n'%var_counts)
-
     config = tf.ConfigProto()
     config.gpu_options.allow_growth = True
     sess = tf.Session(config=config)
+
     sess.run(tf.global_variables_initializer())
+
+    saver = tf.train.Saver()
+    if restore_from_checkpoint is not None:
+        logger.info("Restoring model from {}".format(restore_from_checkpoint))
+        saver.restore(sess, restore_from_checkpoint)
+
+    sess.graph.finalize()
+    logger.log_graph_to_tensorboard(sess.graph)
+
     with sess.as_default():
 
-        num_train_updates_per_epoch = 4
-        num_minibatches_per_epoch_trian_update = 4
         total_timesteps = int(total_timesteps)
-        time_horizon = 128
-        total_epoch_batch_size = time_horizon * num_procs
+        total_epoch_batch_size = time_horizon * num_workers
         num_epochs = total_timesteps // total_epoch_batch_size
-        train_minibatch_size = total_epoch_batch_size // num_minibatches_per_epoch_trian_update
-        gamma = 0.99
-        lam = 0.95
-        target_kl = 0.01
+        train_minibatch_size = total_epoch_batch_size // num_minibatches_per_epoch_train_update
 
         curr_obs = envs.reset()
 
-        curr_dones = np.full(num_procs, False)
+        curr_dones = np.full(num_workers, False)
 
-        curr_episode_returns = np.zeros(num_procs)
-        curr_episode_lengths = np.zeros(num_procs)
+        curr_episode_returns = np.zeros(num_workers)
+        curr_episode_lengths = np.zeros(num_workers)
 
         start_time = time.time()
 
         observations_input_shape = (-1, *envs.observation_space.shape) if observations_are_continous else (-1, 1)
+
+        episode_lengths = deque(maxlen=100)
+        episode_returns = deque(maxlen=100)
+
+        best_mean_episode_return_so_far = -np.inf
+        last_save_time = None
 
         for epoch in range(1, num_epochs+1):
 
@@ -169,6 +221,8 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
             batch_values = []
             batch_dones = []
 
+            rollout_values = []
+
             for t in range(time_horizon):
                 curr_actions, curr_values, curr_logps = sess.run([pi_tf, value_tf, logp_pi_tf],
                                                   feed_dict={observations_tf: np.reshape(curr_obs, observations_input_shape)})
@@ -177,7 +231,7 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
                 # curr_actions = [1]
 
                 for val in curr_values:
-                    logger.store(VVals=val)
+                    rollout_values.append(val)
                 batch_obs.append(curr_obs)
                 batch_actions.append(curr_actions)
                 batch_logps.append(curr_logps)
@@ -192,12 +246,13 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
                 curr_episode_lengths += 1
                 for i, done in enumerate(curr_dones):
                     if done:
-                        print("Episode finished {} reward {} steps".format(curr_episode_returns[i], curr_episode_lengths[i]))
+                        episode_lengths.append(curr_episode_lengths[i])
+                        episode_returns.append(curr_episode_returns[i])
+                        # print("Episode finished {} reward {} steps".format(curr_episode_returns[i], curr_episode_lengths[i]))
                         # any_episodes_were_finished = True
                         # logger.store(EpRet=curr_episode_returns[i], EpLen=curr_episode_lengths[i])
                         curr_episode_returns[i] = 0
                         curr_episode_lengths[i] = 0
-
 
             batch_dones.append(curr_dones)
 
@@ -243,7 +298,6 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
                 batch_returns[n] = returns
                 batch_advantages[n] = advantages
 
-
             final_batch_obs_shape = (total_epoch_batch_size,) + (envs.observation_space.shape if observations_are_continous else (1,))
             batch_obs = batch_obs.reshape(final_batch_obs_shape)
 
@@ -277,12 +331,22 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
             # }
             # logger.log(debug_dict)
 
-
             sample_indexes = np.arange(total_epoch_batch_size)
-            for _ in range(num_train_updates_per_epoch):
+
+            actor_losses = []
+            critic_losses = []
+            kls = []
+            entropies = []
+            clipfractions = []
+            actor_loss_deltas = []
+            critic_loss_deltas = []
+
+            for update_num in range(1, num_train_updates_per_epoch+1):
                 np.random.shuffle(sample_indexes)
-                kls_from_update = []
-                for i in range(num_minibatches_per_epoch_trian_update):
+
+                kls_over_update = []
+
+                for i in range(num_minibatches_per_epoch_train_update):
                     start_index = i * train_minibatch_size
                     end_index = (i+1) * train_minibatch_size
                     samples_indexes_to_train_on = sample_indexes[start_index:end_index]
@@ -294,16 +358,50 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
 
                     pi_l_new, v_l_new, kl, cf = sess.run([pi_loss, v_loss, approx_kl, clipfrac], feed_dict=minibatch_feed_dict)
 
-                    kls_from_update.append(kl)
+                    actor_losses.append(pi_l_old)
+                    critic_losses.append(v_l_old)
+                    kls_over_update.append(kl)
+                    entropies.append(entropy)
+                    clipfractions.append(cf)
+                    actor_loss_deltas.append(pi_l_new - pi_l_old)
+                    critic_loss_deltas.append(v_l_new - v_l_old)
 
-                    logger.store(LossPi=pi_l_old, LossV=v_l_old,
-                                 KL=kl, Entropy=entropy, ClipFrac=cf,
-                                 DeltaLossPi=(pi_l_new - pi_l_old), DeltaLossV=(v_l_new - v_l_old))
+                mean_kl_over_update = np.mean(kls_over_update)
+                kls.append(mean_kl_over_update)
 
-                if np.mean(kls_from_update) > 1.5 * target_kl:
-                    logger.log("early stopping at step {} due to reaching max kl".format(i))
+                if np.mean(mean_kl_over_update) > 1.5 * target_kl:
+                    logger.info("early stopping at step {} due to reaching max kl".format(i))
                     break
-                logger.store(StopIter=i)
+
+            mean_episode_return = np.nan if len(episode_returns) == 0 else np.mean(episode_returns)
+            mean_epsiode_length = np.nan if len(episode_lengths) == 0 else np.mean(episode_lengths)
+
+            logger.record_tabular("epoch", epoch)
+            logger.record_tabular("stop_update_iter", update_num)
+            logger.record_tabular("actor_loss", np.mean(actor_losses))
+            logger.record_tabular("critic_loss", np.mean(critic_losses))
+            logger.record_tabular("kl_div", np.mean(kls))
+            logger.record_tabular("policy_entropy", np.mean(entropies))
+            logger.record_tabular("clip _fracs", np.mean(clipfractions))
+            logger.record_tabular("actor_loss_deltas", np.mean(actor_loss_deltas))
+            logger.record_tabular("critic_loss_deltas", np.mean(critic_loss_deltas))
+            logger.record_tabular("avg_rollout_value", np.mean(rollout_values))
+            logger.record_tabular("avg_ep_return", mean_episode_return)
+            logger.record_tabular("avg_ep_length", mean_epsiode_length)
+            logger.record_tabular("time_steps", epoch * total_epoch_batch_size)
+            logger.record_tabular("seconds_elapsed", time.time() - start_time)
+            logger.dump_tabular()
+
+            if mean_episode_return is not np.nan and mean_episode_return >= best_mean_episode_return_so_far and save_best_model:
+                best_mean_episode_return_so_far = mean_episode_return
+                save_path = os.path.join(logger.get_dir(), 'saved_model', 'model.ckpt')
+                logger.info("New best mean episode return of {}".format(mean_episode_return))
+
+                curr_time = time.time()
+                if (last_save_time is None) or (curr_time - last_save_time >= min_save_interval_seconds):
+                    last_save_time = curr_time
+                    logger.info("Saving model to {}".format(save_path))
+                    saver.save(sess, save_path)
 
         # for i in range(train_pi_iters):
             #     # logger.log("new logp: {}".format(new_logp))
@@ -321,48 +419,62 @@ def run_ppo(envs, use_cnn=False, total_timesteps=2e7, use_kl_penalty_instead_of_
 
 
             #
-            # # Log info about epoch
-            logger.log_tabular('Epoch', epoch)
-            # # if any_episodes_were_finished:
-            # #     logger.log_tabular('EpRet', with_min_and_max=True)
-            # #     logger.log_tabular('EpLen', average_only=True)
-            logger.log_tabular('VVals', with_min_and_max=True)
-            logger.log_tabular('TotalEnvInteracts', epoch * total_epoch_batch_size)
-            logger.log_tabular('LossPi', average_only=True)
-            logger.log_tabular('LossV', average_only=True)
-            logger.log_tabular('DeltaLossPi', average_only=True)
-            logger.log_tabular('DeltaLossV', average_only=True)
-            logger.log_tabular('Entropy', average_only=True)
-            logger.log_tabular('KL', average_only=True)
-            logger.log_tabular('ClipFrac', average_only=True)
-            # logger.log_tabular('StopIter', average_only=True)
-            logger.log_tabular('Time', time.time() - start_time)
-            logger.dump_tabular()
+            # # # Log info about epoch
+            # logger.log_tabular('Epoch', epoch)
+            # # # if any_episodes_were_finished:
+            # # #     logger.log_tabular('EpRet', with_min_and_max=True)
+            # # #     logger.log_tabular('EpLen', average_only=True)
+            # logger.log_tabular('VVals', with_min_and_max=True)
+            # logger.log_tabular('TotalEnvInteracts', epoch * total_epoch_batch_size)
+            # logger.log_tabular('LossPi', average_only=True)
+            # logger.log_tabular('LossV', average_only=True)
+            # logger.log_tabular('DeltaLossPi', average_only=True)
+            # logger.log_tabular('DeltaLossV', average_only=True)
+            # logger.log_tabular('Entropy', average_only=True)
+            # logger.log_tabular('KL', average_only=True)
+            # logger.log_tabular('ClipFrac', average_only=True)
+            # # logger.log_tabular('StopIter', average_only=True)
+            # logger.log_tabular('Time', time.time() - start_time)
+            # logger.dump_tabular()
 
             # exit()
 
 
 if __name__ == '__main__':
 
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    for key, value in DEFAULT_PARAMS.items():
+        key = '--' + key
+        # key = '--' + key.replace('_', '-')
+        parser.add_argument(key, type=get_convert_arg_to_type_fn(type(value)), default=value)
+
+    args = parser.parse_args()
+    dict_args = vars(args)
+
+    logger.configure()
+
+    # dict_args = prepare_params(dict_args)
+    log_params(dict_args)
+
     # env_id = "CartPole-v1"
-    env_id = "PongNoFrameskip-v4"
     # env_id = "HalfCheetah-v2"
-    num_procs = 32
-    seed = 42
-    use_kl_penalty = False
-    total_timesteps = 2e7
+
+    env_id = dict_args['env_id']
+    num_workers = dict_args['num_workers']
+    seed = dict_args['seed']
 
     env_type = get_env_type(env_id)[0]
 
     if env_type == 'atari':
         print("Atari environment detected")
-        envs = make_atari_env(env_id, num_procs, seed)
+        envs = make_atari_env(env_id, num_workers, seed)
     elif env_type == 'mujoco':
         print("Mujoco environment detected")
-        envs = SubprocVecEnv([lambda: make_mujoco_env(env_id, seed + i if seed is not None else None, 1) for i in range(num_procs)])
+        envs = SubprocVecEnv([lambda: make_mujoco_env(env_id, seed + i if seed is not None else None, 1) for i in range(num_workers)])
     else:
         print("No specific environment type detected")
         env_type = None
-        envs = SubprocVecEnv([lambda: gym.make(env_id) for _ in range(num_procs)])
+        envs = SubprocVecEnv([lambda: gym.make(env_id) for _ in range(num_workers)])
 
-    run_ppo(envs=envs, use_cnn=True if env_type == 'atari' else False, total_timesteps=total_timesteps, use_kl_penalty_instead_of_clip=use_kl_penalty)
+    run_ppo(envs=envs, use_cnn=True if env_type == 'atari' else False, **dict_args)
