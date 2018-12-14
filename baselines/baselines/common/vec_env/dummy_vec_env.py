@@ -53,8 +53,12 @@ class DummyVecEnv(VecEnv):
     def close(self):
         return
 
-    def render(self, mode='human'):
-        return [e.render(mode=mode) for e in self.envs]
+    def render(self, mode=None):
+        # Dumb Hack for mujoco to render
+        if mode is None:
+            return [e.render() for e in self.envs]
+        else:
+            return [e.render(mode=mode) for e in self.envs]
 
     def _save_obs(self, e, obs):
         for k in self.keys:

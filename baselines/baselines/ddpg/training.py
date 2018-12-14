@@ -65,7 +65,12 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
         epoch_actions = []
         epoch_qs = []
         epoch_episodes = 0
+
+        episode_lengths = deque(maxlen=100)
+        episode_returns = deque(maxlen=100)
+
         for epoch in range(nb_epochs):
+
             for cycle in range(nb_epoch_cycles):
                 # Perform rollouts.
                 for t_rollout in range(nb_rollout_steps):
@@ -130,6 +135,11 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
                             eval_env.render()
                         eval_episode_reward += eval_r
 
+                        maybeepinfo = eval_info.get('episode')
+                        if maybeepinfo:
+                            episode_lengths.append(maybeepinfo['l'])
+                            episode_returns.append(maybeepinfo['r'])
+
                         eval_qs.append(eval_q)
                         if eval_done:
                             eval_obs = eval_env.reset()
@@ -143,8 +153,14 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
             duration = time.time() - start_time
             stats = agent.get_stats()
             combined_stats = stats.copy()
-            combined_stats['rollout/return'] = np.mean(epoch_episode_rewards)
-            combined_stats['rollout/return_history'] = np.mean(episode_rewards_history)
+            # combined_stats['rollout/return'] = np.mean(epoch_episode_rewards)
+            # combined_stats['rollout/return_history'] = np.mean(episode_rewards_history)
+
+            mean_epsiode_length = np.nan if len(episode_lengths) == 0 else np.mean(episode_lengths)
+            mean_episode_return = np.nan if len(episode_returns) == 0 else np.mean(episode_returns)
+            combined_stats["avg_ep_return"] = mean_episode_return
+            combined_stats["avg_ep_length"] = mean_epsiode_length
+
             combined_stats['rollout/episode_steps'] = np.mean(epoch_episode_steps)
             combined_stats['rollout/actions_mean'] = np.mean(epoch_actions)
             combined_stats['rollout/Q_mean'] = np.mean(epoch_qs)
@@ -158,9 +174,9 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
             combined_stats['rollout/actions_std'] = np.std(epoch_actions)
             # Evaluation statistics.
             if eval_env is not None:
-                combined_stats['eval/return'] = eval_episode_rewards
-                combined_stats['eval/return_history'] = np.mean(eval_episode_rewards_history)
-                combined_stats['eval/Q'] = eval_qs
+                # combined_stats['eval/return'] = np.mean(eval_episode_rewards)
+                # combined_stats['eval/return_history'] = np.mean(eval_episode_rewards_history)
+                # combined_stats['eval/Q'] = eval_qs
                 combined_stats['eval/episodes'] = len(eval_episode_rewards)
             def as_scalar(x):
                 if isinstance(x, np.ndarray):
@@ -170,6 +186,9 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
                     return x
                 else:
                     raise ValueError('expected scalar, got %s'%x)
+
+            assert MPI.COMM_WORLD.Get_size() == 1 # ensuring DDPG is performing with one worker for fair testing in CS268 project
+
             combined_stats_sums = MPI.COMM_WORLD.allreduce(np.array([as_scalar(x) for x in combined_stats.values()]))
             combined_stats = {k : v / mpi_size for (k,v) in zip(combined_stats.keys(), combined_stats_sums)}
 

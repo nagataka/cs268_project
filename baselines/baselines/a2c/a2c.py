@@ -1,5 +1,9 @@
 import time
 import functools
+
+from collections import deque
+import numpy as np
+
 import tensorflow as tf
 
 from baselines import logger
@@ -159,12 +163,24 @@ def learn(
 
     nbatch = nenvs*nsteps
     tstart = time.time()
+
+    episode_lengths_last_100 = deque(maxlen=100)
+    episode_returns_last_100 = deque(maxlen=100)
+
     for update in range(1, total_timesteps//nbatch+1):
-        obs, states, rewards, masks, actions, values = runner.run()
+        obs, states, rewards, masks, actions, values, episode_lengths, episode_returns = runner.run()
+
+        episode_lengths_last_100.extend(episode_lengths)
+        episode_returns_last_100.extend(episode_returns)
+
         policy_loss, value_loss, policy_entropy = model.train(obs, states, rewards, masks, actions, values)
         nseconds = time.time()-tstart
         fps = int((update*nbatch)/nseconds)
         if update % log_interval == 0 or update == 1:
+            mean_epsiode_length = np.nan if len(episode_lengths_last_100) == 0 else np.mean(episode_lengths_last_100)
+            mean_epsiode_return = np.nan if len(episode_returns_last_100) == 0 else np.mean(episode_returns_last_100)
+            logger.record_tabular("avg_ep_length", mean_epsiode_length)
+            logger.record_tabular("avg_ep_return", mean_epsiode_return)
             ev = explained_variance(values, rewards)
             logger.record_tabular("nupdates", update)
             logger.record_tabular("total_timesteps", update*nbatch)

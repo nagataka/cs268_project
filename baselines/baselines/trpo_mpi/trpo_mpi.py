@@ -13,6 +13,9 @@ from baselines.common.input import observation_placeholder
 from baselines.common.policies import build_policy
 from contextlib import contextmanager
 
+episode_lengths_last_100 = deque(maxlen=100)
+episode_returns_last_100 = deque(maxlen=100)
+
 def traj_segment_generator(pi, env, horizon, stochastic):
     # Initialize state variables
     t = 0
@@ -56,7 +59,22 @@ def traj_segment_generator(pi, env, horizon, stochastic):
         acs[i] = ac
         prevacs[i] = prevac
 
-        ob, rew, new, _ = env.step(ac)
+        ob, rew, new, infos = env.step(ac)
+
+        # print("info: {}".format(infos))
+
+        if isinstance(infos, dict):
+            maybeepinfo = infos.get('episode')
+            if maybeepinfo:
+                episode_lengths_last_100.append(maybeepinfo['l'])
+                episode_returns_last_100.append(maybeepinfo['r'])
+        else:
+            for info in infos:
+                maybeepinfo = info.get('episode')
+                if maybeepinfo:
+                    episode_lengths_last_100.append(maybeepinfo['l'])
+                    episode_returns_last_100.append(maybeepinfo['r'])
+
         rews[i] = rew
 
         cur_ep_ret += rew
@@ -260,8 +278,8 @@ def learn(*,
     timesteps_so_far = 0
     iters_so_far = 0
     tstart = time.time()
-    lenbuffer = deque(maxlen=40) # rolling buffer for episode lengths
-    rewbuffer = deque(maxlen=40) # rolling buffer for episode rewards
+    lenbuffer = deque(maxlen=100) # rolling buffer for episode lengths
+    rewbuffer = deque(maxlen=100) # rolling buffer for episode rewards
 
     if sum([max_iters>0, total_timesteps>0, max_episodes>0])==0:
         # noththing to be done
@@ -358,8 +376,13 @@ def learn(*,
         lenbuffer.extend(lens)
         rewbuffer.extend(rews)
 
-        logger.record_tabular("EpLenMean", np.mean(lenbuffer))
-        logger.record_tabular("EpRewMean", np.mean(rewbuffer))
+        mean_epsiode_length = np.nan if len(episode_lengths_last_100) == 0 else np.mean(episode_lengths_last_100)
+        mean_epsiode_return = np.nan if len(episode_returns_last_100) == 0 else np.mean(episode_returns_last_100)
+        logger.record_tabular("avg_ep_length", mean_epsiode_length)
+        logger.record_tabular("avg_ep_return", mean_epsiode_return)
+
+        # logger.record_tabular("EpLenMean", np.mean(lenbuffer))
+        # logger.record_tabular("EpRewMean", np.mean(rewbuffer))
         logger.record_tabular("EpThisIter", len(lens))
         episodes_so_far += len(lens)
         timesteps_so_far += sum(lens)

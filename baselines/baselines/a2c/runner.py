@@ -11,7 +11,7 @@ class Runner(AbstractEnvRunner):
         self.ob_dtype = model.train_model.X.dtype.as_numpy_dtype
     
     def run(self):
-        mb_obs, mb_rewards, mb_actions, mb_values, mb_dones = [],[],[],[],[]
+        mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, episode_lengths, episode_returns = [],[],[],[],[],[],[]
         mb_states = self.states
         for n in range(self.nsteps):
             actions, values, states, _ = self.model.step(self.obs, S=self.states, M=self.dones)
@@ -19,7 +19,7 @@ class Runner(AbstractEnvRunner):
             mb_actions.append(actions)
             mb_values.append(values)
             mb_dones.append(self.dones)
-            obs, rewards, dones, _ = self.env.step(actions)
+            obs, rewards, dones, infos = self.env.step(actions)
             self.states = states
             self.dones = dones
             for n, done in enumerate(dones):
@@ -27,6 +27,13 @@ class Runner(AbstractEnvRunner):
                     self.obs[n] = self.obs[n]*0
             self.obs = obs
             mb_rewards.append(rewards)
+
+            for info in infos:
+                maybeepinfo = info.get('episode')
+                if maybeepinfo:
+                    episode_lengths.append(maybeepinfo['l'])
+                    episode_returns.append(maybeepinfo['r'])
+
         mb_dones.append(self.dones)
         #batch of steps to batch of rollouts
 
@@ -57,4 +64,4 @@ class Runner(AbstractEnvRunner):
         mb_rewards = mb_rewards.flatten()
         mb_values = mb_values.flatten()
         mb_masks = mb_masks.flatten()
-        return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values
+        return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values, episode_lengths, episode_returns
