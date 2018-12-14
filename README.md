@@ -2,6 +2,7 @@
 
 This is CS268 (Intro to Optimization) project of J.B. Lanier and Takashi Nagata.
 
+ppo.py, our primary file with our implementation, is in the ppo_implentation folder.
 
 #### Python environment
 
